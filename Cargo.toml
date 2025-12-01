@@ -1,0 +1,11 @@
+[package]
+name = "gpu-pt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "27.0.1"
+bytemuck = "1.24.0"
+pollster = "0.4.0"
+glam = "0.30.9"
+image = "0.25.8"
