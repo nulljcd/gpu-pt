@@ -8,6 +8,7 @@ A very simple gpu side path tracer for learning purposes.
 - Bvh acceleration
 - Anti-aliasing
 - Easily expandable materials
+- Simple color management
 
 <img width="1920" height="1080" alt="render" src="https://github.com/user-attachments/assets/126d0792-a513-474d-aaf7-2414cfede034" />
 
