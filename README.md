@@ -10,7 +10,7 @@ A simple gpu side path tracer for learning purposes.
 - Easily expandable materials
 - Basic color management
 
-<img width="1920" height="1080" alt="render" src="https://github.com/user-attachments/assets/126d0792-a513-474d-aaf7-2414cfede034" />
+<img width="1920" height="1080" alt="render" src="https://github.com/user-attachments/assets/43dd6056-9665-47eb-9069-85944fb5b7e9" />
 
 - Qwantani Dusk 2 Puresky hdri downloaded from [Poly Haven](https://polyhaven.com/a/qwantani_dusk_2_puresky)
 - Dragon model downloaded from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data)
