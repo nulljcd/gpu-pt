@@ -1,6 +1,6 @@
-use std::{fs, time::Instant};
+use std::fs;
 
-use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
+use bytemuck::{bytes_of, checked::cast_slice};
 use glam::{EulerRot, Mat3, Vec3};
 use image::{DynamicImage, ExtendedColorType, ImageError, ImageReader, save_buffer};
 use wgpu::util::DeviceExt;
@@ -38,7 +38,6 @@ struct Triangle {
     v0: Vec3,
     v1: Vec3,
     v2: Vec3,
-    material_index: usize,
 }
 
 impl Triangle {
@@ -68,320 +67,194 @@ enum BvhNode {
     },
 }
 
-struct Material {
-    albedo: Vec3,
+struct GpuUniforms {
+    bytes: Vec<u8>,
 }
 
-struct RenderData {
-    resolution: (usize, usize),
-    num_samples: usize,
-    num_bounces: usize,
-    bvh_root_node_index: usize,
-    camera_position: Vec3,
-    camera_rotation: Mat3,
-    camera_fov: f32,
-    environment_resolution: (usize, usize),
-}
+impl GpuUniforms {
+    fn build(
+        resolution: (usize, usize),
+        num_samples: usize,
+        num_bounces: usize,
+        bvh_root_node_index: usize,
+        camera_position: Vec3,
+        camera_rotation: Mat3,
+        camera_fov: f32,
+        environment_image_resolution: (usize, usize),
+    ) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuTriangleSection0 {
-    v0_uu: [f32; 4],
-    u_uv: [f32; 4],
-    v_vv: [f32; 4],
-    normal_inv_d1: [f32; 4],
-}
+        bytes.extend_from_slice(cast_slice(&[
+            resolution.0 as u32,
+            num_samples as u32,
+            num_bounces as u32,
+            bvh_root_node_index as u32,
+        ]));
+        bytes.extend_from_slice(cast_slice(&[
+            camera_position.x,
+            camera_position.y,
+            camera_position.z,
+            camera_fov,
+            camera_rotation.x_axis.x,
+            camera_rotation.x_axis.y,
+            camera_rotation.x_axis.z,
+            1. / (num_samples as f32),
+            camera_rotation.y_axis.x,
+            camera_rotation.y_axis.y,
+            camera_rotation.y_axis.z,
+            (resolution.0 as f32) / (resolution.1 as f32),
+            camera_rotation.z_axis.x,
+            camera_rotation.z_axis.y,
+            camera_rotation.z_axis.z,
+            (camera_fov * 0.5).tan(),
+            1. / (resolution.0 as f32),
+            1. / (resolution.1 as f32),
+            environment_image_resolution.0 as f32,
+            environment_image_resolution.1 as f32,
+        ]));
 
-impl From<&Triangle> for GpuTriangleSection0 {
-    fn from(value: &Triangle) -> Self {
-        let u: Vec3 = value.v1 - value.v0;
-        let v: Vec3 = value.v2 - value.v0;
-        let uu: f32 = u.length_squared();
-        let uv: f32 = u.dot(v);
-        let vv: f32 = v.length_squared();
-        let normal: Vec3 = u.cross(v).normalize();
-        let inv_d1: f32 = 1. / (uu * vv - uv * uv);
-
-        Self {
-            v0_uu: [value.v0.x, value.v0.y, value.v0.z, uu],
-            u_uv: [u.x, u.y, u.z, uv],
-            v_vv: [v.x, v.y, v.z, vv],
-            normal_inv_d1: [normal.x, normal.y, normal.z, inv_d1],
-        }
+        Self { bytes }
     }
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuTriangleSection1 {
-    material_index: [u32; 4],
-    normal: [f32; 4],
+struct GpuTrianglesSection0 {
+    bytes: Vec<u8>,
 }
 
-impl From<&Triangle> for GpuTriangleSection1 {
-    fn from(value: &Triangle) -> Self {
-        let u: Vec3 = value.v1 - value.v0;
-        let v: Vec3 = value.v2 - value.v0;
-        let normal: Vec3 = u.cross(v).normalize();
+impl GpuTrianglesSection0 {
+    fn build(triangles: &[Triangle]) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
 
-        Self {
-            material_index: [value.material_index as u32, 0, 0, 0],
-            normal: [normal.x, normal.y, normal.z, 0.],
-        }
+        triangles.iter().for_each(|triangle| {
+            let u: Vec3 = triangle.v1 - triangle.v0;
+            let v: Vec3 = triangle.v2 - triangle.v0;
+            let uu: f32 = u.length_squared();
+            let uv: f32 = u.dot(v);
+            let vv: f32 = v.length_squared();
+            let normal: Vec3 = u.cross(v).normalize();
+            let inv_d1: f32 = 1. / (uu * vv - uv * uv);
+
+            bytes.extend_from_slice(cast_slice(&[
+                triangle.v0.x,
+                triangle.v0.y,
+                triangle.v0.z,
+                uu,
+                u.x,
+                u.y,
+                u.z,
+                uv,
+                v.x,
+                v.y,
+                v.z,
+                vv,
+                normal.x,
+                normal.y,
+                normal.z,
+                inv_d1,
+            ]));
+        });
+
+        Self { bytes }
     }
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuBvhNodeSection0 {
-    a_b_node_type: [u32; 4],
+struct GpuTrianglesSection1 {
+    bytes: Vec<u8>,
 }
 
-impl From<&BvhNode> for GpuBvhNodeSection0 {
-    fn from(value: &BvhNode) -> Self {
-        let (a, b, node_type) = match value {
-            BvhNode::Internal {
-                left_child_index,
-                right_child_index,
-                bounding_box: _,
-            } => (*left_child_index as u32, *right_child_index as u32, 0),
-            BvhNode::Leaf {
-                triangles_range_start,
-                triangles_range_end,
-                bounding_box: _,
-            } => (
-                *triangles_range_start as u32,
-                *triangles_range_end as u32,
-                1,
-            ),
-        };
+impl GpuTrianglesSection1 {
+    fn build(triangles: &[Triangle]) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
 
-        Self {
-            a_b_node_type: [a, b, node_type, 0],
-        }
+        triangles.iter().for_each(|triangle| {
+            let normal: Vec3 = (triangle.v1 - triangle.v0)
+                .cross(triangle.v2 - triangle.v0)
+                .normalize();
+
+            bytes.extend_from_slice(cast_slice(&[normal.x, normal.y, normal.z, 0.]));
+        });
+
+        Self { bytes }
     }
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuBvhNodeSection1 {
-    min: [f32; 4],
-    max: [f32; 4],
+struct GpuBvhNodesSection0 {
+    bytes: Vec<u8>,
 }
 
-impl From<&BvhNode> for GpuBvhNodeSection1 {
-    fn from(value: &BvhNode) -> Self {
-        let (min, max) = match value {
-            BvhNode::Internal {
-                left_child_index: _,
-                right_child_index: _,
-                bounding_box,
-            } => (bounding_box.min, bounding_box.max),
-            BvhNode::Leaf {
-                triangles_range_start: _,
-                triangles_range_end: _,
-                bounding_box,
-            } => (bounding_box.min, bounding_box.max),
-        };
+impl GpuBvhNodesSection0 {
+    fn build(bvh_nodes: &[BvhNode]) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
 
-        Self {
-            min: [min.x, min.y, min.z, 0.],
-            max: [max.x, max.y, max.z, 0.],
-        }
+        bvh_nodes.iter().for_each(|bvh_node| {
+            let (a, b, node_type) = match bvh_node {
+                BvhNode::Internal {
+                    left_child_index,
+                    right_child_index,
+                    bounding_box: _,
+                } => (*left_child_index as u32, *right_child_index as u32, 0),
+                BvhNode::Leaf {
+                    triangles_range_start,
+                    triangles_range_end,
+                    bounding_box: _,
+                } => (
+                    *triangles_range_start as u32,
+                    *triangles_range_end as u32,
+                    1,
+                ),
+            };
+
+            bytes.extend_from_slice(cast_slice(&[a, b, node_type, 0]));
+        });
+
+        Self { bytes }
     }
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuMaterial {
-    albedo: [f32; 4],
+struct GpuBvhNodesSection1 {
+    bytes: Vec<u8>,
 }
 
-impl From<&Material> for GpuMaterial {
-    fn from(value: &Material) -> Self {
-        Self {
-            albedo: [value.albedo.x, value.albedo.y, value.albedo.z, 0.],
-        }
+impl GpuBvhNodesSection1 {
+    fn build(bvh_nodes: &[BvhNode]) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
+
+        bvh_nodes.iter().for_each(|bvh_node| {
+            let (min, max) = match bvh_node {
+                BvhNode::Internal {
+                    left_child_index: _,
+                    right_child_index: _,
+                    bounding_box,
+                } => (bounding_box.min, bounding_box.max),
+                BvhNode::Leaf {
+                    triangles_range_start: _,
+                    triangles_range_end: _,
+                    bounding_box,
+                } => (bounding_box.min, bounding_box.max),
+            };
+
+            bytes.extend_from_slice(cast_slice(&[
+                min.x, min.y, min.z, 0., max.x, max.y, max.z, 0.,
+            ]));
+        });
+
+        Self { bytes }
     }
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuRenderData {
-    resolution_x_num_samples_num_bounces_bvh_root_node_index: [u32; 4],
-    camera_position_camera_fov: [f32; 4],
-    camera_rotation_axis_x_inverse_num_samples: [f32; 4],
-    camera_rotation_axis_y_aspect_ratio: [f32; 4],
-    camera_rotation_axis_z_camera_fov_scale: [f32; 4],
-    inverse_resolution_environment_resolution: [f32; 4],
+struct GpuImage {
+    bytes: Vec<u8>,
 }
 
-impl From<&RenderData> for GpuRenderData {
-    fn from(value: &RenderData) -> Self {
-        Self {
-            resolution_x_num_samples_num_bounces_bvh_root_node_index: [
-                value.resolution.0 as u32,
-                value.num_samples as u32,
-                value.num_bounces as u32,
-                value.bvh_root_node_index as u32,
-            ],
-            camera_position_camera_fov: [
-                value.camera_position.x,
-                value.camera_position.y,
-                value.camera_position.z,
-                value.camera_fov,
-            ],
-            camera_rotation_axis_x_inverse_num_samples: [
-                value.camera_rotation.x_axis.x,
-                value.camera_rotation.x_axis.y,
-                value.camera_rotation.x_axis.z,
-                1. / (value.num_samples as f32),
-            ],
-            camera_rotation_axis_y_aspect_ratio: [
-                value.camera_rotation.y_axis.x,
-                value.camera_rotation.y_axis.y,
-                value.camera_rotation.y_axis.z,
-                (value.resolution.0 as f32) / (value.resolution.1 as f32),
-            ],
-            camera_rotation_axis_z_camera_fov_scale: [
-                value.camera_rotation.z_axis.x,
-                value.camera_rotation.z_axis.y,
-                value.camera_rotation.z_axis.z,
-                (value.camera_fov * 0.5).tan(),
-            ],
-            inverse_resolution_environment_resolution: [
-                1. / (value.resolution.0 as f32),
-                1. / (value.resolution.1 as f32),
-                value.environment_resolution.0 as f32,
-                value.environment_resolution.1 as f32,
-            ],
-        }
-    }
-}
+impl GpuImage {
+    fn build(buffer: &[Vec3]) -> Self {
+        let mut bytes: Vec<u8> = Vec::new();
 
-struct GpuReadyTrianglesData {
-    gpu_triangles_section0: Vec<GpuTriangleSection0>,
-    gpu_triangles_section1: Vec<GpuTriangleSection1>,
-}
-
-impl From<&[Triangle]> for GpuReadyTrianglesData {
-    fn from(value: &[Triangle]) -> Self {
-        let gpu_triangles_section0: Vec<GpuTriangleSection0> = value
+        buffer
             .iter()
-            .map(|triangle| GpuTriangleSection0::from(triangle))
-            .collect();
-        let gpu_triangles_section1: Vec<GpuTriangleSection1> = value
-            .iter()
-            .map(|triangle| GpuTriangleSection1::from(triangle))
-            .collect();
+            .for_each(|color| bytes.extend_from_slice(bytes_of(&[color.x, color.y, color.z, 0.])));
 
-        Self {
-            gpu_triangles_section0,
-            gpu_triangles_section1,
-        }
-    }
-}
-
-impl GpuReadyTrianglesData {
-    fn get_section0_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_triangles_section0)
-    }
-
-    fn get_section1_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_triangles_section1)
-    }
-}
-
-struct GpuReadyBvhNodesData {
-    gpu_bvh_nodes_section0: Vec<GpuBvhNodeSection0>,
-    gpu_bvh_nodes_section1: Vec<GpuBvhNodeSection1>,
-}
-
-impl From<&[BvhNode]> for GpuReadyBvhNodesData {
-    fn from(value: &[BvhNode]) -> Self {
-        let gpu_bvh_nodes_section0: Vec<GpuBvhNodeSection0> = value
-            .iter()
-            .map(|bvh_node| GpuBvhNodeSection0::from(bvh_node))
-            .collect();
-        let gpu_bvh_nodes_section1: Vec<GpuBvhNodeSection1> = value
-            .iter()
-            .map(|bvh_node| GpuBvhNodeSection1::from(bvh_node))
-            .collect();
-
-        Self {
-            gpu_bvh_nodes_section0,
-            gpu_bvh_nodes_section1,
-        }
-    }
-}
-
-impl GpuReadyBvhNodesData {
-    fn get_section0_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_bvh_nodes_section0)
-    }
-
-    fn get_section1_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_bvh_nodes_section1)
-    }
-}
-
-struct GpuReadyMaterialsData {
-    gpu_materials: Vec<GpuMaterial>,
-}
-
-impl From<&[Material]> for GpuReadyMaterialsData {
-    fn from(value: &[Material]) -> Self {
-        let gpu_materials: Vec<GpuMaterial> = value
-            .iter()
-            .map(|material| GpuMaterial::from(material))
-            .collect();
-
-        Self { gpu_materials }
-    }
-}
-
-impl GpuReadyMaterialsData {
-    fn get_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_materials)
-    }
-}
-
-struct GpuReadyImageBuffer {
-    gpu_buffer: Vec<[f32; 4]>,
-}
-
-impl From<&[Vec3]> for GpuReadyImageBuffer {
-    fn from(value: &[Vec3]) -> Self {
-        let gpu_buffer: Vec<[f32; 4]> = value
-            .iter()
-            .map(|color| [color.x, color.y, color.z, 0.])
-            .collect();
-
-        Self { gpu_buffer }
-    }
-}
-
-impl GpuReadyImageBuffer {
-    fn get_bytes(&self) -> &[u8] {
-        cast_slice(&self.gpu_buffer)
-    }
-}
-
-struct GpuReadyRenderData {
-    gpu_render_data: GpuRenderData,
-}
-
-impl From<&RenderData> for GpuReadyRenderData {
-    fn from(value: &RenderData) -> Self {
-        let gpu_render_data: GpuRenderData = GpuRenderData::from(value);
-
-        Self { gpu_render_data }
-    }
-}
-
-impl GpuReadyRenderData {
-    fn get_bytes(&self) -> &[u8] {
-        bytes_of(&self.gpu_render_data)
+        Self { bytes }
     }
 }
 
@@ -424,7 +297,6 @@ fn load_triangles_from_obj(
     position: Vec3,
     scale: Vec3,
     rotation: Mat3,
-    material_index: usize,
 ) -> Option<Vec<Triangle>> {
     let contents: String = fs::read_to_string(path).ok()?;
 
@@ -456,28 +328,12 @@ fn load_triangles_from_obj(
                         * *vertices.get(parts[3].split('/').next()?.parse::<usize>().ok()? - 1)?
                         * scale
                         + position,
-                    material_index,
                 });
             }
         }
     }
 
     Some(triangles)
-}
-
-pub fn load_environment_from_hdr(path: &str, strength: f32) -> Option<(Vec<Vec3>, (usize, usize))> {
-    let img: DynamicImage = ImageReader::open(path).ok()?.decode().ok()?;
-    let rgb32f: image::ImageBuffer<image::Rgb<f32>, Vec<f32>> = match img {
-        DynamicImage::ImageRgb32F(img) => img,
-        other => other.to_rgb32f(),
-    };
-    let (width, height) = rgb32f.dimensions();
-    let resolution: (usize, usize) = (width as usize, height as usize);
-    let buffer: Vec<Vec3> = rgb32f
-        .pixels()
-        .map(|p: &image::Rgb<f32>| Vec3::new(p[0] * strength, p[1] * strength, p[2] * strength))
-        .collect();
-    Some((buffer, resolution))
 }
 
 fn build_bvh(input_triangles: Vec<Triangle>) -> (Vec<Triangle>, Vec<BvhNode>, usize) {
@@ -624,6 +480,21 @@ fn build_bvh(input_triangles: Vec<Triangle>) -> (Vec<Triangle>, Vec<BvhNode>, us
     (final_triangles, bvh_nodes, bvh_root_node_index)
 }
 
+pub fn load_image_from_hdr(path: &str, strength: f32) -> Option<(Vec<Vec3>, (usize, usize))> {
+    let img: DynamicImage = ImageReader::open(path).ok()?.decode().ok()?;
+    let rgb32f: image::ImageBuffer<image::Rgb<f32>, Vec<f32>> = match img {
+        DynamicImage::ImageRgb32F(img) => img,
+        other => other.to_rgb32f(),
+    };
+    let (width, height) = rgb32f.dimensions();
+    let resolution: (usize, usize) = (width as usize, height as usize);
+    let buffer: Vec<Vec3> = rgb32f
+        .pixels()
+        .map(|p: &image::Rgb<f32>| Vec3::new(p[0] * strength, p[1] * strength, p[2] * strength))
+        .collect();
+    Some((buffer, resolution))
+}
+
 fn render(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -636,14 +507,13 @@ fn render(
     triangles: &[Triangle],
     bvh_nodes: &[BvhNode],
     bvh_root_node_index: usize,
-    materials: &[Material],
-    environment_buffer: &[Vec3],
-    environment_resolution: (usize, usize),
+    environment_image_buffer: &[Vec3],
+    environment_image_resolution: (usize, usize),
 ) -> Vec<Vec3> {
     let shader_module: wgpu::ShaderModule =
         device.create_shader_module(wgpu::include_wgsl!("renderer.wgsl"));
 
-    let render_data: RenderData = RenderData {
+    let gpu_uniforms: GpuUniforms = GpuUniforms::build(
         resolution,
         num_samples,
         num_bounces,
@@ -651,56 +521,48 @@ fn render(
         camera_position,
         camera_rotation,
         camera_fov,
-        environment_resolution,
-    };
+        environment_image_resolution,
+    );
+    let gpu_triangles_section0: GpuTrianglesSection0 = GpuTrianglesSection0::build(triangles);
+    let gpu_triangles_section1: GpuTrianglesSection1 = GpuTrianglesSection1::build(triangles);
+    let gpu_bvh_nodes_section0: GpuBvhNodesSection0 = GpuBvhNodesSection0::build(bvh_nodes);
+    let gpu_bvh_nodes_section1: GpuBvhNodesSection1 = GpuBvhNodesSection1::build(bvh_nodes);
+    let gpu_environment_image: GpuImage = GpuImage::build(environment_image_buffer);
 
-    let gpu_ready_triangles_data: GpuReadyTrianglesData = GpuReadyTrianglesData::from(triangles);
-    let gpu_ready_bvh_nodes_data: GpuReadyBvhNodesData = GpuReadyBvhNodesData::from(bvh_nodes);
-    let gpu_ready_materials_data: GpuReadyMaterialsData = GpuReadyMaterialsData::from(materials);
-    let gpu_ready_environment_buffer_data: GpuReadyImageBuffer =
-        GpuReadyImageBuffer::from(environment_buffer);
-    let gpu_ready_render_data: GpuReadyRenderData = GpuReadyRenderData::from(&render_data);
-
-    let triangles_section0_data_buffer: wgpu::Buffer =
+    let triangles_section0_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_triangles_data.get_section0_bytes(),
+            contents: &gpu_triangles_section0.bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let triangles_section1_data_buffer: wgpu::Buffer =
+    let triangles_section1_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_triangles_data.get_section1_bytes(),
+            contents: &gpu_triangles_section1.bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let bvh_section0_data_buffer: wgpu::Buffer =
+    let bvh_nodes_section0_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_bvh_nodes_data.get_section0_bytes(),
+            contents: &gpu_bvh_nodes_section0.bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let bvh_section1_data_buffer: wgpu::Buffer =
+    let bvh_nodes_section1_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_bvh_nodes_data.get_section1_bytes(),
+            contents: &gpu_bvh_nodes_section1.bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let materials_data_buffer: wgpu::Buffer =
+    let environment_image_buffer_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_materials_data.get_bytes(),
+            contents: &gpu_environment_image.bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let environment_buffer_data_buffer: wgpu::Buffer =
+    let uniforms_buffer: wgpu::Buffer =
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: &gpu_ready_environment_buffer_data.get_bytes(),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-    let render_data_buffer: wgpu::Buffer =
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: &gpu_ready_render_data.get_bytes(),
+            contents: &gpu_uniforms.bytes,
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -730,7 +592,7 @@ fn render(
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -790,16 +652,6 @@ fn render(
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform {},
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -832,34 +684,30 @@ fn render(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: triangles_section0_data_buffer.as_entire_binding(),
+                resource: uniforms_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: triangles_section1_data_buffer.as_entire_binding(),
+                resource: triangles_section0_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: bvh_section0_data_buffer.as_entire_binding(),
+                resource: triangles_section1_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: bvh_section1_data_buffer.as_entire_binding(),
+                resource: bvh_nodes_section0_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: materials_data_buffer.as_entire_binding(),
+                resource: bvh_nodes_section1_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: environment_buffer_data_buffer.as_entire_binding(),
+                resource: environment_image_buffer_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: render_data_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
                 resource: output_buffer.as_entire_binding(),
             },
         ],
@@ -888,12 +736,7 @@ fn render(
     let buffer_slice: wgpu::BufferSlice<'_> = download_buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
 
-    let start_time: Instant = Instant::now();
-
     let _ = device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-
-    println!("render info: ");
-    println!(" - time: {:#?}", start_time.elapsed());
 
     let buffer_view: wgpu::BufferView = buffer_slice.get_mapped_range();
     let raw_values: &[[f32; 4]] = cast_slice(&buffer_view);
@@ -905,34 +748,6 @@ fn render(
     download_buffer.unmap();
 
     buffer
-}
-
-fn save_buffer_to_file(
-    resolution: (usize, usize),
-    buffer: &[Vec3],
-    path: &str,
-) -> Result<(), ImageError> {
-    #[inline]
-    const fn to_u8(v: f32) -> u8 {
-        (v.clamp(0., 1.) * 255. + 0.5) as u8
-    }
-
-    let byte_buffer: Vec<u8> = buffer
-        .iter()
-        .map(|c| [to_u8(c.x), to_u8(c.y), to_u8(c.z)])
-        .collect::<Vec<[u8; 3]>>()
-        .iter()
-        .flatten()
-        .copied()
-        .collect();
-
-    save_buffer(
-        path,
-        &byte_buffer,
-        resolution.0 as u32,
-        resolution.1 as u32,
-        ExtendedColorType::Rgb8,
-    )
 }
 
 pub enum ViewTransform {
@@ -990,82 +805,85 @@ impl Colorspace {
     }
 }
 
-pub struct ColorManager {
-    pub exposure_value: f32,
-    pub view_transform: ViewTransform,
-    pub colorspace: Colorspace,
+fn color_manage(
+    buffer: &mut Vec<Vec3>,
+    exposure_value: f32,
+    view_transform: &ViewTransform,
+    colorspace: &Colorspace,
+) {
+    let exposure_multiplier: f32 = exposure_value.exp2();
+    buffer.iter_mut().for_each(|color| {
+        *color *= exposure_multiplier;
+        view_transform.apply(color);
+        colorspace.apply(color);
+    });
 }
 
-impl ColorManager {
-    pub fn apply_exposure(color: &mut Vec3, exposure_value: f32) {
-        let multiplier_strength: f32 = exposure_value.exp2();
-
-        *color *= multiplier_strength;
+fn save_buffer_to_file(
+    resolution: (usize, usize),
+    buffer: &[Vec3],
+    path: &str,
+) -> Result<(), ImageError> {
+    #[inline]
+    const fn to_u8(v: f32) -> u8 {
+        (v.clamp(0., 1.) * 255. + 0.5) as u8
     }
 
-    pub fn apply(&self, buffer: &mut Vec<Vec3>) {
-        let start_time: Instant = Instant::now();
-        buffer.iter_mut().for_each(|color| {
-            Self::apply_exposure(color, self.exposure_value);
-            self.view_transform.apply(color);
-            self.colorspace.apply(color);
-        });
-        println!("color management: {:#?}", start_time.elapsed());
-    }
+    let byte_buffer: Vec<u8> = buffer
+        .iter()
+        .map(|c| [to_u8(c.x), to_u8(c.y), to_u8(c.z)])
+        .collect::<Vec<[u8; 3]>>()
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+
+    save_buffer(
+        path,
+        &byte_buffer,
+        resolution.0 as u32,
+        resolution.1 as u32,
+        ExtendedColorType::Rgb8,
+    )
 }
 
 fn main() {
     let (device, queue) = setup_gpu().expect("failed to setup gpu");
 
-    let resolution: (usize, usize) = (1920, 1080);
-
-    let materials: Vec<Material> = vec![
-        Material {
-            albedo: Vec3::splat(0.8),
-        },
-        Material {
-            albedo: Vec3::new(0.8196, 0.4667, 1.),
-        },
-    ];
+    // let resolution: (usize, usize) = (1920, 1080);
+    let resolution: (usize, usize) = (2560, 1600);
+    // let resolution: (usize, usize) = (256, 160);
 
     let mut input_triangles: Vec<Triangle> = Vec::new();
-    input_triangles.extend(
-        load_triangles_from_obj(
-            "res/dragon.obj",
-            Vec3::new(0., 0., 0.),
-            Vec3::ONE,
-            Mat3::from_euler(EulerRot::XYZ, 0., 2., 0.),
-            0,
-        )
-        .expect("failed to load obj file"),
-    );
     input_triangles.extend(
         load_triangles_from_obj(
             "res/plane.obj",
             Vec3::new(0., -0.275, 0.),
             Vec3::splat(3.),
             Mat3::from_euler(EulerRot::XYZ, 0., 0., 0.),
-            1,
+        )
+        .expect("failed to load obj file"),
+    );
+    input_triangles.extend(
+        load_triangles_from_obj(
+            "res/dragon.obj",
+            Vec3::new(0., 0., 0.),
+            Vec3::ONE,
+            Mat3::from_euler(EulerRot::XYZ, 0., 2., 0.),
         )
         .expect("failed to load obj file"),
     );
 
     let (triangles, bvh_nodes, bvh_root_node_index) = build_bvh(input_triangles);
 
-    let (environment_buffer, environment_resolution) =
-        load_environment_from_hdr("res/sky.hdr", 0.2).expect("failed to load environment from hdr");
-
-    let color_manager: ColorManager = ColorManager {
-        exposure_value: 0.,
-        view_transform: ViewTransform::Aces,
-        colorspace: Colorspace::Srgb,
-    };
+    let (environment_image_buffer, environment_image_resolution) =
+        load_image_from_hdr("res/sky.hdr", 0.2).expect("failed to load environment from hdr");
 
     let mut buffer: Vec<Vec3> = render(
         &device,
         &queue,
         resolution,
-        16,
+        64,
         6,
         Vec3::new(0., 0., 1.),
         Mat3::from_euler(glam::EulerRot::XYZ, 0., 0., 0.),
@@ -1073,12 +891,11 @@ fn main() {
         &triangles,
         &bvh_nodes,
         bvh_root_node_index,
-        &materials,
-        &environment_buffer,
-        environment_resolution,
+        &environment_image_buffer,
+        environment_image_resolution,
     );
 
-    color_manager.apply(&mut buffer);
+    color_manage(&mut buffer, 0., &ViewTransform::Aces, &Colorspace::Srgb);
 
     save_buffer_to_file(resolution, &buffer, "render.png").expect("failed to save buffer to file");
 }
